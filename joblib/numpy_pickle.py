@@ -12,6 +12,12 @@ import sys
 import os
 import zlib
 import warnings
+import numpy as np
+
+from numpy.lib.format import magic
+from numpy.lib.format import write_array_header_1_0
+from numpy.lib.format import header_data_from_array_1_0
+from numpy.lib.format import isfileobj
 
 from ._compat import _basestring
 
@@ -21,21 +27,17 @@ if sys.version_info[0] >= 3:
     Unpickler = pickle._Unpickler
     Pickler = pickle._Pickler
 
-    def asbytes(s):
-        if isinstance(s, bytes):
-            return s
-        return s.encode('latin1')
 else:
     Unpickler = pickle.Unpickler
     Pickler = pickle.Pickler
-    asbytes = str
+
 
 _MEGA = 2 ** 20
 _MAX_LEN = len(hex(2 ** 64))
 
 # To detect file types
-_ZFILE_PREFIX = asbytes('ZF')
-
+_ZFILE_PREFIX = b'ZF'
+_CHUNK_SIZE = 64 * 1024
 
 ###############################################################################
 # Compressed file with Zlib
@@ -44,10 +46,10 @@ def _read_magic(file_handle):
     """ Utility to check the magic signature of a file identifying it as a
         Zfile
     """
-    magic = file_handle.read(len(_ZFILE_PREFIX))
+    magic_ = file_handle.read(len(_ZFILE_PREFIX))
     # Pickling needs file-handles at the beginning of the file
     file_handle.seek(0)
-    return magic
+    return magic_
 
 
 def read_zfile(file_handle):
@@ -65,7 +67,17 @@ def read_zfile(file_handle):
     length = int(length, 16)
     # We use the known length of the data to tell Zlib the size of the
     # buffer to allocate.
-    data = zlib.decompress(file_handle.read(), 15, length)
+
+    decompresser= zlib.decompressobj()
+    data = ''
+    while True:
+        chunk = file_handle.read(_CHUNK_SIZE)
+        if not chunk:
+            break
+        data += decompresser.decompress(chunk)
+    data += decompresser.flush()  # Read the remainder
+
+
     assert len(data) == length, (
         "Incorrect data length while decompressing %s."
         "The file could be corrupted." % file_handle)
@@ -79,14 +91,132 @@ def write_zfile(file_handle, data, compress=1):
     for persistence. Backward compatibility is not guarantied. Do not
     use for external purposes.
     """
+    compresser = zlib.compressobj(compress)
     file_handle.write(_ZFILE_PREFIX)
-    length = hex(len(data))
-    if sys.version_info[0] < 3 and type(length) is long:
-        # We need to remove the trailing 'L' in the hex representation
-        length = length[:-1]
-    # Store the length of the data
-    file_handle.write(asbytes(length.ljust(_MAX_LEN)))
-    file_handle.write(zlib.compress(asbytes(data), compress))
+    length = hex(len(data)).encode('ascii')
+    # If python 2.x, we need to remove the trailing 'L' in the hex representation
+    length = length.rstrip(b'L')
+
+    file_handle.write(length.ljust(_MAX_LEN))
+
+    # Write the data out in chunks
+    for i in xrange(len(data)//_CHUNK_SIZE+1):
+        chunk = data[i*_CHUNK_SIZE:(i+1)*_CHUNK_SIZE]
+        file_handle.write(compresser.compress(chunk))
+    tail = compresser.flush()
+    if tail: # Write the remainder
+        file_handle.write(tail)
+
+
+def np_write_array(fp, array, version=(1, 0)):
+    """
+    Write an array to an NPY file, including a header.
+
+    If the array is neither C-contiguous nor Fortran-contiguous AND the
+    file_like object is not a real file object, this function will have to
+    copy data in memory.
+
+    Parameters
+    ----------
+    fp : file_like object
+        An open, writable file object, or similar object with a ``.write()``
+        method.
+    array : ndarray
+        The array to write to disk.
+    version : (int, int), optional
+        The version number of the format.  Default: (1, 0)
+
+    Raises
+    ------
+    ValueError
+        If the array cannot be persisted.
+    Various other errors
+        If the array contains Python objects as part of its dtype, the
+        process of pickling them may raise various errors if the objects
+        are not picklable.
+
+    """
+    if version != (1, 0):
+        msg = "we only support format version (1,0), not %s"
+        raise ValueError(msg % (version,))
+    fp.write(magic(*version))
+    write_array_header_1_0(fp, header_data_from_array_1_0(array))
+
+    # Set buffer size to 16 MiB to hide the Python loop overhead.
+    buffersize = max(16 * 1024 ** 2 // array.itemsize, 1)
+
+    if array.dtype.hasobject:
+        # We contain Python objects so we cannot write out the data directly.
+        # Instead, we will pickle it out with version 2 of the pickle protocol.
+        pickle.dump(array, fp, protocol=2)
+    elif array.flags.f_contiguous and not array.flags.c_contiguous:
+        if isfileobj(fp):
+            array.T.tofile(fp)
+        else:
+            for chunk in np.nditer(
+                    array, flags=['external_loop', 'buffered', 'zerosize_ok'],
+                    buffersize=buffersize, order='F'):
+                fp.write(chunk.tostring('C'))
+    else:
+        if isfileobj(fp):
+            array.tofile(fp)
+        else:
+            for chunk in np.nditer(
+                    array, flags=['external_loop', 'buffered', 'zerosize_ok'],
+                    buffersize=buffersize, order='C'):
+                fp.write(chunk.tostring('C'))
+
+
+def np_save(file, arr):
+    """
+    Save an array to a binary file in NumPy ``.npy`` format.
+
+    Parameters
+    ----------
+    file : file or str
+        File or filename to which the data is saved.  If file is a file-object,
+        then the filename is unchanged.  If file is a string, a ``.npy``
+        extension will be appended to the file name if it does not already
+        have one.
+    arr : array_like
+        Array data to be saved.
+
+    See Also
+    --------
+    savez : Save several arrays into a ``.npz`` archive
+    savetxt, load
+
+    Notes
+    -----
+    For a description of the ``.npy`` format, see `format`.
+
+    Examples
+    --------
+    >>> from tempfile import TemporaryFile
+    >>> outfile = TemporaryFile()
+
+    >>> x = np.arange(10)
+    >>> np.save(outfile, x)
+
+    >>> outfile.seek(0) # Only needed here to simulate closing & reopening file
+    >>> np.load(outfile)
+    array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+
+    """
+    own_fid = False
+    if isinstance(file, basestring):
+        if not file.endswith('.npy'):
+            file = file + '.npy'
+        fid = open(file, "wb")
+        own_fid = True
+    else:
+        fid = file
+    try:
+        arr = np.asanyarray(arr)
+        np_write_array(fid, arr)
+    finally:
+        if own_fid:
+            fid.close()
 
 
 ###############################################################################
@@ -107,19 +237,19 @@ class NDArrayWrapper(object):
         "Reconstruct the array"
         filename = os.path.join(unpickler._dirname, self.filename)
         # Load the array from the disk
-        if unpickler.np.__version__ >= '1.3':
-            array = unpickler.np.load(filename,
+        if np.__version__ >= '1.3':
+            array = np.load(filename,
                             mmap_mode=unpickler.mmap_mode)
         else:
             # Numpy does not have mmap_mode before 1.3
-            array = unpickler.np.load(filename)
+            array = np.load(filename)
         # Reconstruct subclasses. This does not work with old
         # versions of numpy
         if (hasattr(array, '__array_prepare__')
-                and not self.subclass in (unpickler.np.ndarray,
-                                      unpickler.np.memmap)):
+                and not self.subclass in (np.ndarray,
+                                      np.memmap)):
             # We need to reconstruct another subclass
-            new_array = unpickler.np.core.multiarray._reconstruct(
+            new_array = np.core.multiarray._reconstruct(
                     self.subclass, (0,), 'b')
             new_array.__array_prepare__(array)
             array = new_array
@@ -155,9 +285,10 @@ class ZNDArrayWrapper(NDArrayWrapper):
         # Here we a simply reproducing the unpickling mechanism for numpy
         # arrays
         filename = os.path.join(unpickler._dirname, self.filename)
-        array = unpickler.np.core.multiarray._reconstruct(*self.init_args)
+        array = np.core.multiarray._reconstruct(*self.init_args)
         data = read_zfile(open(filename, 'rb'))
         state = self.state + (data,)
+        print(map(type, state))
         array.__setstate__(state)
         return array
 
@@ -190,16 +321,10 @@ class NumpyPickler(Pickler):
         self._npy_counter = 0
         Pickler.__init__(self, self.file,
                                 protocol=pickle.HIGHEST_PROTOCOL)
-        # delayed import of numpy, to avoid tight coupling
-        try:
-            import numpy as np
-        except ImportError:
-            np = None
-        self.np = np
 
     def _write_array(self, array, filename):
         if not self.compress:
-            self.np.save(filename, array)
+            np_save(filename, array)
             container = NDArrayWrapper(os.path.basename(filename),
                                        type(array))
         else:
@@ -207,15 +332,16 @@ class NumpyPickler(Pickler):
             # Efficient compressed storage:
             # The meta data is stored in the container, and the core
             # numerics in a z-file
-            _, init_args, state = array.__reduce__()
+            init_args = (type(array), (0, ), 'b')
+            version = 1
+            state = (version, array.shape, array.dtype,  np.isfortran(array))
+
             # the last entry of 'state' is the data itself
             zfile = open(filename, 'wb')
-            write_zfile(zfile, state[-1],
-                                compress=self.compress)
+            write_zfile(zfile, array.data, compress=self.compress)
             zfile.close()
-            state = state[:-1]
             container = ZNDArrayWrapper(os.path.basename(filename),
-                                            init_args, state)
+                                        init_args, state)
         return container, filename
 
     def save(self, obj):
@@ -223,15 +349,15 @@ class NumpyPickler(Pickler):
             files, rather than pickling them. Of course, this is a
             total abuse of the Pickler class.
         """
-        if self.np is not None and type(obj) in (self.np.ndarray,
-                                            self.np.matrix, self.np.memmap):
+        if np is not None and type(obj) in (np.ndarray,
+                                            np.matrix, np.memmap):
             size = obj.size * obj.itemsize
             if self.compress and size < self.cache_size * _MEGA:
                 # When compressing, as we are not writing directly to the
                 # disk, it is more efficient to use standard pickling
-                if type(obj) is self.np.memmap:
+                if type(obj) is np.memmap:
                     # Pickling doesn't work with memmaped arrays
-                    obj = self.np.asarray(obj)
+                    obj = np.asarray(obj)
                 return Pickler.save(self, obj)
             self._npy_counter += 1
             try:
@@ -267,11 +393,6 @@ class NumpyUnpickler(Unpickler):
         self.mmap_mode = mmap_mode
         self.file_handle = self._open_pickle(file_handle)
         Unpickler.__init__(self, self.file_handle)
-        try:
-            import numpy as np
-        except ImportError:
-            np = None
-        self.np = np
 
     def _open_pickle(self, file_handle):
         return file_handle
@@ -286,9 +407,6 @@ class NumpyUnpickler(Unpickler):
         """
         Unpickler.load_build(self)
         if isinstance(self.stack[-1], NDArrayWrapper):
-            if self.np is None:
-                raise ImportError('Trying to unpickle an ndarray, '
-                        "but numpy didn't import correctly")
             nd_array_wrapper = self.stack.pop()
             array = nd_array_wrapper.read(self)
             self.stack.append(array)
