@@ -296,19 +296,22 @@ class NumpyPickler(Pickler):
         return Pickler.save(self, obj)
 
     def close(self):
+        # we close that externally
         pass
 
     def save_nd_array(self, obj, pack=struct.pack):
+        print('save_nd_array')
         n = obj.array.nbytes
-        self.write(BINARRAY + pack("<i", n))
+        self.write(BINARRAY + pack("<I", n))
         np_write_array(self.file, obj.array)
     dispatch[NDArrayWrapper] = save_nd_array
 
     def save_znp_array(self, obj, pack=struct.pack):
+        print('save_znp_array')
         n = obj.array.nbytes
-        self.write(BINARRAY + pack("<i", n))
+        self.write(BINARRAY + pack("<I", n))
         np_write_array(self.file, obj.array)
-    dispatch[ZNDArrayWrapper] = save_znd_array
+    dispatch[ZNDArrayWrapper] = save_znp_array
 
 
 
