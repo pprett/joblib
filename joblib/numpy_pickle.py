@@ -49,6 +49,9 @@ _MEGA = 2 ** 20
 _ZFILE_PREFIX = asbytes('ZF')
 _MAX_LEN = len(hex_str(2 ** 64))
 
+_IFILE_PREFIX = asbytes('IF')
+_IFILE_PREFIX_LEN = len(_IFILE_PREFIX)
+_HEADER_LEN = _IFILE_PREFIX_LEN + _MAX_LEN
 
 ###############################################################################
 # Compressed file with Zlib
@@ -113,6 +116,36 @@ def write_zfile(file_handle, data, compress=1):
 
 
 ###############################################################################
+# Ifile util
+def read_ifile_offsets(file_handle):
+    file_handle.seek(0)
+    assert _read_magic(file_handle) == _IFILE_PREFIX, \
+        "File does not have the right magic"
+    length = file_handle.read(_HEADER_LEN)
+    length = length[_IFILE_PREFIX_LEN:]
+    length = int(length, 16)
+    file_handle.seek(0)
+    return _HEADER_LEN + length
+
+
+def open_memmap(fp, np):
+    version = np.lib.format.read_magic(fp)
+    np.lib.format._check_version(version)
+    shape, fortran_order, dtype = np.lib.format._read_array_header(fp, version)
+    if dtype.hasobject:
+        msg = "Array can't be memory-mapped: Python objects in dtype."
+        raise ValueError(msg)
+    offset = fp.tell()
+    if fortran_order:
+        order = 'F'
+    else:
+        order = 'C'
+
+    marray = np.memmap(fp.name, dtype=dtype, shape=shape, order=order,
+                       mode='r', offset=offset)
+    return marray
+
+###############################################################################
 # Utility objects for persistence.
 
 class NDArrayWrapper(object):
@@ -131,7 +164,6 @@ class NDArrayWrapper(object):
         "Reconstruct the array"
         filename = os.path.join(unpickler._dirname, self.filename)
         # Load the array from the disk
-        np_ver = [int(x) for x in unpickler.np.__version__.split('.', 2)[:2]]
 
         # use getattr instead of self.allow_mmap to ensure backward compat
         # with NDArrayWrapper instances pickled with joblib < 0.9.0
@@ -139,6 +171,51 @@ class NDArrayWrapper(object):
         memmap_kwargs = ({} if not allow_mmap
                          else {'mmap_mode': unpickler.mmap_mode})
         array = unpickler.np.load(filename, **memmap_kwargs)
+        # Reconstruct subclasses. This does not work with old
+        # versions of numpy
+        if (hasattr(array, '__array_prepare__')
+                and not self.subclass in (unpickler.np.ndarray,
+                                      unpickler.np.memmap)):
+            # We need to reconstruct another subclass
+            new_array = unpickler.np.core.multiarray._reconstruct(
+                    self.subclass, (0,), 'b')
+            new_array.__array_prepare__(array)
+            array = new_array
+        return array
+
+    #def __reduce__(self):
+    #    return None
+
+
+class InlineNDArrayWrapper(NDArrayWrapper):
+    """ An object to be persisted instead of numpy arrays.
+
+        The only thing this object does, is to carry the offset in which
+        the array has been persisted, and the array subclass.
+    """
+    def __init__(self, subclass, offset, allow_mmap=True):
+        "Store the useful information for later"
+        self.subclass = subclass
+        self.offset = offset
+        self.allow_mmap = allow_mmap
+
+    def read(self, unpickler):
+        "Reconstruct the array"
+
+        np_ver = [int(x) for x in unpickler.np.__version__.split('.', 2)[:2]]
+
+        mmap_mode = unpickler.mmap_mode
+
+        fd = unpickler.file_handle
+        pos = fd.tell()
+        fd.seek(unpickler._array_segment_offset + self.offset)
+        try:
+            if mmap_mode:
+                array = open_memmap(fd, unpickler.np)
+            else:
+                array = unpickler.np.load(fd)
+        finally:
+            fd.seek(pos)
         # Reconstruct subclasses. This does not work with old
         # versions of numpy
         if (hasattr(array, '__array_prepare__')
@@ -305,6 +382,94 @@ class NumpyPickler(Pickler):
                 write_zfile(zfile, self.file.getvalue(), self.compress)
 
 
+class InlineNumpyPickler(Pickler):
+    """A pickler to persist of big data efficiently.
+
+        The main features of this object are:
+
+         * persistence of numpy arrays by postfixing them to the pickle file.
+    """
+    dispatch = Pickler.dispatch.copy()
+
+    def __init__(self, filename):
+        self._filename = filename
+        self._filenames = [filename]
+
+        self.file = open(filename, 'wb')
+
+        # write header
+        self.file.write(_IFILE_PREFIX)
+        # use dummy length
+        self.file.write(asbytes(hex_str(0).ljust(_MAX_LEN)))
+
+        # Count the number of npy arrays
+        self._npy_counter = 0
+        self._npy_arrays = []
+        self._npy_offset = 0
+
+        highest_python_2_3_compatible_protocol = 2
+        Pickler.__init__(self, self.file,
+                         protocol=highest_python_2_3_compatible_protocol)
+        # delayed import of numpy, to avoid tight coupling
+        try:
+            import numpy as np
+        except ImportError:
+            np = None
+        self.np = np
+
+    def _write_array(self, obj):
+        size = obj.size * obj.itemsize
+        assert size == obj.nbytes
+        self._npy_arrays.append(obj)
+        old_npy_array_offset = self._npy_offset
+        container = InlineNDArrayWrapper(type(obj), old_npy_array_offset)
+        self._npy_offset = old_npy_array_offset + size
+        return container
+
+    def save(self, obj):
+        """ Subclass the save method, to postfix ndarray subclasses in
+        the pickle file. Of course, this is a total abuse of the Pickler class.
+        """
+        if self.np is not None and type(obj) in (self.np.ndarray,
+                                            self.np.matrix, self.np.memmap) and obj.dtype not in (self.np.dtype('O'), ):
+            self._npy_counter += 1
+            obj = self._write_array(obj)
+        return Pickler.save(self, obj)
+
+    def save_bytes(self, obj):
+        """Strongly inspired from python 2.7 pickle.Pickler.save_string"""
+        if self.bin:
+            n = len(obj)
+            if n < 256:
+                self.write(pickle.SHORT_BINSTRING + asbytes(chr(n)) + obj)
+            else:
+                self.write(pickle.BINSTRING + struct.pack("<i", n) + obj)
+            self.memoize(obj)
+        else:
+            Pickler.save_bytes(self, obj)
+
+    # We need to override save_bytes for python 3. We are using
+    # protocol=2 for python 2/3 compatibility and save_bytes for
+    # protocol < 3 ends up creating a unicode string which is very
+    # inefficient resulting in pickles up to 1.5 times the size you
+    # would get with protocol=4 or protocol=2 with python 2.7. This
+    # cause severe slowdowns in joblib.dump and joblib.load. See
+    # https://github.com/joblib/joblib/issues/194 for more details.
+    if PY3:
+        dispatch[bytes] = save_bytes
+
+    def close(self):
+        # length of pickled content
+        pkl_length = self.file.tell() - _HEADER_LEN
+        # append arrays
+        for obj in self._npy_arrays:
+            self.np.save(self.file, obj)
+        # seek to begin and update header length
+        self.file.seek(_IFILE_PREFIX_LEN)
+        self.file.write(asbytes(hex_str(pkl_length).ljust(_MAX_LEN)))
+
+
+
 class NumpyUnpickler(Unpickler):
     """A subclass of the Unpickler to unpickle our numpy pickles.
     """
@@ -410,10 +575,30 @@ class ZipNumpyUnpickler(NumpyUnpickler):
         return BytesIO(read_zfile(file_handle))
 
 
+class InlineNumpyUnpickler(NumpyUnpickler):
+    """A subclass of the Unpickler to unpickle our numpy pickles.
+    """
+
+    def __init__(self, filename, file_handle, array_segment_offset, mmap_mode=None):
+        self._filename = os.path.basename(filename)
+        self._array_segment_offset = array_segment_offset
+        self.mmap_mode = mmap_mode
+        self.file_handle = self._open_pickle(file_handle)
+        Unpickler.__init__(self, self.file_handle)
+        try:
+            import numpy as np
+        except ImportError:
+            np = None
+        self.np = np
+
+        if PY3:
+            self.encoding = 'bytes'
+
+
 ###############################################################################
 # Utility functions
 
-def dump(value, filename, compress=0, cache_size=100):
+def dump(value, filename, compress=0, cache_size=100, inline=False):
     """Fast persistence of an arbitrary Python object into a files, with
     dedicated storage for numpy arrays.
 
@@ -433,6 +618,8 @@ def dump(value, filename, compress=0, cache_size=100):
         for in-memory compression. Note that this is just an order of
         magnitude estimate and that for big arrays, the code will go
         over this value at dump and at load time.
+    inline: bool
+        Whether or not to store numpy arrays within the pickle file or externally.
 
     Returns
     -------
@@ -463,8 +650,11 @@ def dump(value, filename, compress=0, cache_size=100):
               % (filename, type(filename))
             )
     try:
-        pickler = NumpyPickler(filename, compress=compress,
-                               cache_size=cache_size)
+        if inline:
+            pickler = InlineNumpyPickler(filename)
+        else:
+            pickler = NumpyPickler(filename, compress=compress,
+                                   cache_size=cache_size)
         pickler.dump(value)
         pickler.close()
     finally:
@@ -510,12 +700,19 @@ def load(filename, mmap_mode=None):
         # avoid race-conditions on renames. That said, if data are stored in
         # companion files, moving the directory will create a race when
         # joblib tries to access the companion files.
-        if _read_magic(file_handle) == _ZFILE_PREFIX:
+        magic = _read_magic(file_handle)
+        if magic == _ZFILE_PREFIX:
             if mmap_mode is not None:
                 warnings.warn('file "%(filename)s" appears to be a zip, '
                               'ignoring mmap_mode "%(mmap_mode)s" flag passed'
                               % locals(), Warning, stacklevel=2)
             unpickler = ZipNumpyUnpickler(filename, file_handle=file_handle)
+        elif magic == _IFILE_PREFIX:
+            array_segment_offset = read_ifile_offsets(file_handle)
+            file_handle.seek(_HEADER_LEN)
+            unpickler = InlineNumpyUnpickler(filename, file_handle=file_handle,
+                                             array_segment_offset=array_segment_offset,
+                                             mmap_mode=mmap_mode)
         else:
             unpickler = NumpyUnpickler(filename, file_handle=file_handle,
                                        mmap_mode=mmap_mode)
