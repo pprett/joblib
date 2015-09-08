@@ -365,3 +365,48 @@ def test_numpy_subclass():
     numpy_pickle.dump(a, filename)
     c = numpy_pickle.load(filename)
     nose.tools.assert_true(isinstance(c, SubArray))
+
+
+
+class Container(object):
+
+    def __init__(self, **kwargs):
+        self.dct = {k: v for k, v in kwargs.iteritems()}
+
+
+@with_numpy
+def test_numpy_inline():
+    expected_list = [
+        np.arange(5),
+        Container(a=np.arange(5, dtype=np.int64),
+                  b=np.arange(5, dtype=np.float64)),
+        Container(a=np.arange(256, dtype=np.uint8),
+                  b=np.zeros((5, ), dtype=np.object))
+                     ]
+
+    def container_equals(a, b):
+        nose.tools.assert_equal(sorted(a.dct.keys()), sorted(b.dct.keys()))
+        for k in a.dct:
+            expected = a.dct[k]
+            result = b.dct[k]
+            if isinstance(expected, np.ndarray):
+                nose.tools.assert_equal(result.dtype, expected.dtype)
+                np.testing.assert_equal(result, expected)
+            else:
+                nose.tools.assert_equal(result, expected)
+
+    for container in expected_list:
+        with tempfile.NamedTemporaryFile(suffix='.pkl', dir=env['dir']) as f:
+            fname = f.name
+
+        try:
+            numpy_pickle.dump(container, fname, inline=True)
+            for mmap_mode in ['r', None]:
+                result = numpy_pickle.load(fname, mmap_mode=mmap_mode)
+                if isinstance(container, Container):
+                    container_equals(container, result)
+                else:
+                    nose.tools.assert_equal(result.dtype, container.dtype)
+                    np.testing.assert_equal(result, container)
+        finally:
+            os.remove(fname)

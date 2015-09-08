@@ -24,6 +24,7 @@ PY3 = sys.version_info[0] >= 3
 if PY3:
     Unpickler = pickle._Unpickler
     Pickler = pickle._Pickler
+    from io.StringIO import StringIO
 
     def asbytes(s):
         if isinstance(s, bytes):
@@ -33,6 +34,7 @@ else:
     Unpickler = pickle.Unpickler
     Pickler = pickle.Pickler
     asbytes = str
+    from cStringIO import StringIO
 
 
 def hex_str(an_int):
@@ -388,6 +390,18 @@ class InlineNumpyPickler(Pickler):
         The main features of this object are:
 
          * persistence of numpy arrays by postfixing them to the pickle file.
+
+       One can think of each inline pickle file as containing 3 segments:
+
+           Metadata segment | Pickle segment | Array segment
+
+       The metadata segment is fixed lenght and contains a magic prefix (`_IFILE_PREFIX`)
+       and the lenght of the Pickle segment (stored in a 19 byte hex string repr).
+
+       The pickle segment is a regular pickle dump but with all numpy array objects
+       replaced by InlineNDArrayWrapper objects that hold offsets (in bytes) to the
+       Array segment.
+       The array segment contains a sequence of np.save dumps.
     """
     dispatch = Pickler.dispatch.copy()
 
@@ -418,20 +432,33 @@ class InlineNumpyPickler(Pickler):
         self.np = np
 
     def _write_array(self, obj):
-        size = obj.size * obj.itemsize
-        assert size == obj.nbytes
+        """Write array will return a container for the numpy array that holds the
+        offset of the serialized array in the postfix segment.
+
+        The offset is computed by taking the old offset and adding the size of the header
+        (`np.lib.format._write_array_header`) and the size of the data (`obj.nbytes`).
+
+        The actual arrays are written in `self.close` .
+        """
+        # get header size
+        buf = StringIO()
+        self.np.lib.format._write_array_header(
+            buf, self.np.lib.format.header_data_from_array_1_0(obj), version=None)
+        header_len = buf.tell()
+        # size = header size + data size
+        size = header_len + obj.nbytes
+
         self._npy_arrays.append(obj)
-        old_npy_array_offset = self._npy_offset
-        container = InlineNDArrayWrapper(type(obj), old_npy_array_offset)
-        self._npy_offset = old_npy_array_offset + size
+        container = InlineNDArrayWrapper(type(obj), self._npy_offset)
+        self._npy_offset += size
         return container
 
     def save(self, obj):
         """ Subclass the save method, to postfix ndarray subclasses in
         the pickle file. Of course, this is a total abuse of the Pickler class.
         """
-        if self.np is not None and type(obj) in (self.np.ndarray,
-                                            self.np.matrix, self.np.memmap) and obj.dtype not in (self.np.dtype('O'), ):
+        if (self.np is not None and type(obj) in (self.np.ndarray, self.np.matrix, self.np.memmap)
+            and obj.dtype not in (self.np.dtype('O'), )):
             self._npy_counter += 1
             obj = self._write_array(obj)
         return Pickler.save(self, obj)
@@ -459,15 +486,17 @@ class InlineNumpyPickler(Pickler):
         dispatch[bytes] = save_bytes
 
     def close(self):
+        """Close writes the postfix segment and updates the len of the pickle segment. """
         # length of pickled content
         pkl_length = self.file.tell() - _HEADER_LEN
         # append arrays
         for obj in self._npy_arrays:
+            #t0 = self.file.tell()
             self.np.save(self.file, obj)
+            #print('close size: {}'.format(self.file.tell() - t0))
         # seek to begin and update header length
         self.file.seek(_IFILE_PREFIX_LEN)
         self.file.write(asbytes(hex_str(pkl_length).ljust(_MAX_LEN)))
-
 
 
 class NumpyUnpickler(Unpickler):
